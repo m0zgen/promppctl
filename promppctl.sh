@@ -13,6 +13,9 @@ GITHUB_REPO="${GITHUB_REPO:-deckhouse/prompp}"
 PROMPP_VERSION="${PROMPP_VERSION:-latest}"
 PROMPP_ARCH="${PROMPP_ARCH:-auto}"
 PROMPP_URL="${PROMPP_URL:-}"
+# If 1, "latest" is resolved from /releases and includes RC/prerelease builds.
+# If 0, "latest" uses GitHub /releases/latest, which usually excludes prereleases.
+PROMPP_INCLUDE_PRERELEASES="${PROMPP_INCLUDE_PRERELEASES:-1}"
 
 # Use existing Prometheus user/group for smoother permissions.
 PROMPP_USER="${PROMPP_USER:-prometheus}"
@@ -53,7 +56,7 @@ FORCE_MIGRATE="${FORCE_MIGRATE:-0}"
 REPLACE_PROMETHEUS="${REPLACE_PROMETHEUS:-1}"
 
 log() {
-  echo -e "\033[32m[promppctl]\033[0m $*"
+  echo -e "\033[32m[promppctl]\033[0m $*" >&2
 }
 
 warn() {
@@ -139,7 +142,11 @@ normalize_arch() {
 
 github_api_url_for_release() {
   if [[ "${PROMPP_VERSION}" == "latest" || -z "${PROMPP_VERSION}" ]]; then
-    echo "https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+    if [[ "${PROMPP_INCLUDE_PRERELEASES}" == "1" ]]; then
+      echo "https://api.github.com/repos/${GITHUB_REPO}/releases"
+    else
+      echo "https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+    fi
   else
     echo "https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${PROMPP_VERSION}"
   fi
@@ -160,19 +167,18 @@ resolve_release_url() {
   log "Repo:    ${GITHUB_REPO}"
   log "Release: ${PROMPP_VERSION}"
   log "Arch:    ${arch}"
+  log "Include prereleases: ${PROMPP_INCLUDE_PRERELEASES}"
   log "API:     ${api_url}"
 
   asset_url="$(
-    {
-      curl -fsSL "${api_url}" \
-        | grep 'browser_download_url' \
-        | awk '{print $2}' \
-        | tr -d '"' \
-        | grep -Ei "${arch}" \
-        | grep -Ei '\.tar\.gz$|\.tgz$' \
-        | grep -Eiv 'sha256|checksum|checksums|sig|asc' \
-        | head -n1
-    } || true
+    curl -fsSL "${api_url}" \
+      | grep 'browser_download_url' \
+      | awk '{print $2}' \
+      | tr -d '"' \
+      | grep -Ei "${arch}" \
+      | grep -Ei '\.tar\.gz$|\.tgz$' \
+      | grep -Eiv 'sha256|checksum|checksums|sig|asc' \
+      | head -n1 || true
   )"
 
   if [[ -z "${asset_url}" ]]; then
@@ -188,6 +194,7 @@ resolve_release_url() {
   log "Tag: ${tag:-unknown}"
   log "URL: ${asset_url}"
 
+  # IMPORTANT: stdout must contain URL only.
   echo "${asset_url}"
 }
 
