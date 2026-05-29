@@ -124,6 +124,32 @@ sudo MIGRATE_DATA=0 LISTEN_ADDRESS="0.0.0.0:9090" ./promppctl.sh install
 
 > Exposing Prom++ on `0.0.0.0` should be combined with firewall, VPN, reverse proxy, or other network access controls.
 
+## Offline Installation
+
+Without migration:
+
+```bash
+sudo OFFLINE_ARCHIVE="/root/prompp-binaries-amd64.tar.gz" \
+  MIGRATE_DATA=0 \
+  LISTEN_ADDRESS="127.0.0.1:9091" \
+  ./promppctl.sh install
+```
+
+With migration:
+
+```bash
+sudo OFFLINE_ARCHIVE="/root/prompp-binaries-amd64.tar.gz" \
+  ./promppctl.sh install
+```
+
+Offline update:
+
+```bash
+sudo OFFLINE_ARCHIVE="/root/prompp-binaries-amd64.tar.gz" \
+  ./promppctl.sh release-update
+```
+
+
 ## Migration from Prometheus
 
 Default migration mode is enabled:
