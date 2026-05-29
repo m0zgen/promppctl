@@ -493,6 +493,7 @@ copy_tsdb() {
 
   if [[ -n "$(find "${DATA_DIR}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
     if [[ "${FORCE_MIGRATE}" != "1" ]]; then
+      warn "Systemctl status prompp.service: Not installed."
       die "DATA_DIR is not empty: ${DATA_DIR}. Use FORCE_MIGRATE=1 to overwrite it, or set MIGRATE_DATA=0"
     fi
 
