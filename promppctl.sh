@@ -1,16 +1,5 @@
 #!/usr/bin/env bash
-# Author: Yevgeniy Goncharov aka xck, http://sys-adm.in
-# Prom++ installer script for Linux with safe migration of existing Prometheus data.
-
 set -euo pipefail
-
-# Sys env / paths / etc
-# -------------------------------------------------------------------------------------------\
-PATH=$PATH:/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin
-SCRIPT_PATH=$(cd `dirname "${BASH_SOURCE[0]}"` && pwd)
-
-# Initial variables
-# ---------------------------------------------------\
 
 APP_NAME="prompp"
 
@@ -57,9 +46,6 @@ FORCE_MIGRATE="${FORCE_MIGRATE:-0}"
 
 # If enabled, installer stops/disables prometheus.service before starting prompp.
 REPLACE_PROMETHEUS="${REPLACE_PROMETHEUS:-1}"
-
-# Helper functions
-# -------------------------------------------------------------------------------------------/
 
 log() {
   echo -e "\033[32m[promppctl]\033[0m $*"
@@ -499,9 +485,6 @@ Examples:
   sudo $0 uninstall
 EOF
 }
-
-# Main command dispatch
-# -------------------------------------------------------------------------------------------/
 
 case "${1:-}" in
   install)
