@@ -17,6 +17,12 @@ PROMPP_URL="${PROMPP_URL:-}"
 # If 0, "latest" uses GitHub /releases/latest, which usually excludes prereleases.
 PROMPP_INCLUDE_PRERELEASES="${PROMPP_INCLUDE_PRERELEASES:-1}"
 
+# Offline install/update mode.
+# If set, the script does not download anything and installs binaries from this local archive.
+# Example:
+#   sudo OFFLINE_ARCHIVE="/root/prompp-binaries-amd64.tar.gz" ./promppctl.sh install
+OFFLINE_ARCHIVE="${OFFLINE_ARCHIVE:-}"
+
 # Use existing Prometheus user/group for smoother permissions.
 PROMPP_USER="${PROMPP_USER:-prometheus}"
 PROMPP_GROUP="${PROMPP_GROUP:-prometheus}"
@@ -317,15 +323,30 @@ EOF
 download_and_extract_release() {
   local url="$1"
   local tmp_dir="$2"
+  local archive_path="${tmp_dir}/prompp.tar.gz"
 
-  log "Downloading Prom++ release"
-  log "URL: ${url}"
+  if [[ -n "${OFFLINE_ARCHIVE}" ]]; then
+    log "Offline archive mode enabled"
+    log "Archive: ${OFFLINE_ARCHIVE}"
 
-  curl -fL --retry 3 --retry-delay 2 "${url}" -o "${tmp_dir}/prompp.tar.gz"
+    if [[ ! -f "${OFFLINE_ARCHIVE}" ]]; then
+      die "OFFLINE_ARCHIVE not found: ${OFFLINE_ARCHIVE}"
+    fi
+
+    cp -a "${OFFLINE_ARCHIVE}" "${archive_path}"
+  else
+    log "Downloading Prom++ release"
+    log "URL: ${url}"
+
+    curl -fL --retry 3 --retry-delay 2 "${url}" -o "${archive_path}"
+  fi
 
   log "Extracting archive"
   mkdir -p "${tmp_dir}/extract"
-  tar -xzf "${tmp_dir}/prompp.tar.gz" -C "${tmp_dir}/extract"
+
+  if ! tar -xzf "${archive_path}" -C "${tmp_dir}/extract"; then
+    die "Failed to extract archive: ${archive_path}"
+  fi
 
   log "Archive binaries found:"
   find "${tmp_dir}/extract" -maxdepth 4 -type f -perm -111 -print || true
@@ -374,7 +395,11 @@ install_binary() {
   local tmp_dir url
   tmp_dir="$(mktemp -d)"
 
-  url="$(resolve_release_url)"
+  if [[ -n "${OFFLINE_ARCHIVE}" ]]; then
+    url="offline://${OFFLINE_ARCHIVE}"
+  else
+    url="$(resolve_release_url)"
+  fi
 
   if ! download_and_extract_release "${url}" "${tmp_dir}"; then
     rm -rf "${tmp_dir}"
@@ -419,7 +444,12 @@ release_update() {
   old_version="$(current_prompp_version || true)"
   [[ -n "${old_version}" ]] && log "Current version: ${old_version}"
 
-  url="$(resolve_release_url)"
+  if [[ -n "${OFFLINE_ARCHIVE}" ]]; then
+    url="offline://${OFFLINE_ARCHIVE}"
+  else
+    url="$(resolve_release_url)"
+  fi
+
   tmp_dir="$(mktemp -d)"
 
   if ! download_and_extract_release "${url}" "${tmp_dir}"; then
@@ -743,6 +773,7 @@ Release environment overrides:
   PROMPP_VERSION=${PROMPP_VERSION}
   PROMPP_ARCH=${PROMPP_ARCH}
   PROMPP_URL=${PROMPP_URL:-}
+  OFFLINE_ARCHIVE=${OFFLINE_ARCHIVE:-}
 
 Common environment overrides:
   PROMPP_USER=${PROMPP_USER}
@@ -774,6 +805,10 @@ Examples:
   sudo PROMPP_VERSION="v0.8.0-rc3" $0 release-update
 
   sudo PROMPP_URL="https://github.com/deckhouse/prompp/releases/download/v0.8.0-rc3/prompp-binaries-amd64.tar.gz" $0 release-update
+
+  sudo OFFLINE_ARCHIVE="/root/prompp-binaries-amd64.tar.gz" $0 install
+
+  sudo OFFLINE_ARCHIVE="/root/prompp-binaries-amd64.tar.gz" $0 release-update
 
   sudo $0 uninstall
 EOF
