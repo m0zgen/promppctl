@@ -1,13 +1,19 @@
+```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
 APP_NAME="prompp"
+PROMPPCTL_VERSION="2026-05-29.3"
 
-# Known working release asset format:
-# https://github.com/deckhouse/prompp/releases/download/v0.8.0-rc3/prompp-binaries-amd64.tar.gz
-PROMPP_VERSION="${PROMPP_VERSION:-v0.8.0-rc3}"
-PROMPP_ARCH="${PROMPP_ARCH:-amd64}"
-PROMPP_URL="${PROMPP_URL:-https://github.com/deckhouse/prompp/releases/download/${PROMPP_VERSION}/prompp-binaries-${PROMPP_ARCH}.tar.gz}"
+GITHUB_REPO="${GITHUB_REPO:-deckhouse/prompp}"
+
+# Release selection:
+# - PROMPP_URL wins if explicitly provided.
+# - PROMPP_VERSION can pin a version/tag.
+# - Otherwise install/release-update auto-detects latest release asset from GitHub API.
+PROMPP_VERSION="${PROMPP_VERSION:-latest}"
+PROMPP_ARCH="${PROMPP_ARCH:-auto}"
+PROMPP_URL="${PROMPP_URL:-}"
 
 # Use existing Prometheus user/group for smoother permissions.
 PROMPP_USER="${PROMPP_USER:-prometheus}"
@@ -78,7 +84,8 @@ check_os() {
 
 need_cmds() {
   local missing=0
-  for cmd in curl tar install find cp date grep sed chmod chown getent id; do
+
+  for cmd in curl tar install find cp date grep sed awk tr chmod chown getent id systemctl; do
     if ! command -v "${cmd}" >/dev/null 2>&1; then
       echo "Missing command: ${cmd}" >&2
       missing=1
@@ -108,6 +115,116 @@ detect_arch() {
       die "Unsupported architecture: ${arch}"
       ;;
   esac
+}
+
+normalize_arch() {
+  if [[ "${PROMPP_ARCH}" == "auto" || -z "${PROMPP_ARCH}" ]]; then
+    detect_arch
+  else
+    case "${PROMPP_ARCH}" in
+      x86_64)
+        echo "amd64"
+        ;;
+      aarch64|arm64)
+        echo "arm64"
+        ;;
+      amd64)
+        echo "amd64"
+        ;;
+      *)
+        echo "${PROMPP_ARCH}"
+        ;;
+    esac
+  fi
+}
+
+github_api_url_for_release() {
+  if [[ "${PROMPP_VERSION}" == "latest" || -z "${PROMPP_VERSION}" ]]; then
+    echo "https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+  else
+    echo "https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${PROMPP_VERSION}"
+  fi
+}
+
+resolve_release_url() {
+  local arch api_url asset_url tag
+
+  if [[ -n "${PROMPP_URL}" ]]; then
+    echo "${PROMPP_URL}"
+    return
+  fi
+
+  arch="$(normalize_arch)"
+  api_url="$(github_api_url_for_release)"
+
+  log "Resolving Prom++ release asset from GitHub API"
+  log "Repo:    ${GITHUB_REPO}"
+  log "Release: ${PROMPP_VERSION}"
+  log "Arch:    ${arch}"
+  log "API:     ${api_url}"
+
+  asset_url="$(
+    {
+      curl -fsSL "${api_url}" \
+        | grep 'browser_download_url' \
+        | awk '{print $2}' \
+        | tr -d '"' \
+        | grep -Ei "${arch}" \
+        | grep -Ei '\.tar\.gz$|\.tgz$' \
+        | grep -Eiv 'sha256|checksum|checksums|sig|asc' \
+        | head -n1
+    } || true
+  )"
+
+  if [[ -z "${asset_url}" ]]; then
+    die "Could not find release asset for arch=${arch}. Try PROMPP_URL=... or check: ${api_url}"
+  fi
+
+  tag="$(
+    echo "${asset_url}" \
+      | sed -nE 's#^.*/releases/download/([^/]+)/.*$#\1#p'
+  )"
+
+  log "Resolved release:"
+  log "Tag: ${tag:-unknown}"
+  log "URL: ${asset_url}"
+
+  echo "${asset_url}"
+}
+
+current_prompp_version() {
+  if [[ -x "${BIN_PATH}" ]]; then
+    "${BIN_PATH}" --version 2>/dev/null | head -n1 || true
+  fi
+}
+
+unit_exists() {
+  local unit="$1"
+  local load_state=""
+
+  # Reliable unit detection.
+  # Do not use "systemctl list-unit-files | grep -q" here:
+  # with "set -o pipefail", grep -q can close the pipe early after a match,
+  # systemctl may receive SIGPIPE, and the whole pipeline can become false.
+  load_state="$(systemctl show "${unit}" --property=LoadState --value 2>/dev/null || true)"
+
+  [[ "${load_state}" == "loaded" ]]
+}
+
+unit_is_active() {
+  local unit="$1"
+  systemctl is-active --quiet "${unit}" 2>/dev/null
+}
+
+unit_debug_state() {
+  local unit="$1"
+  local load_state unit_file_state active_state
+
+  load_state="$(systemctl show "${unit}" --property=LoadState --value 2>/dev/null || true)"
+  unit_file_state="$(systemctl show "${unit}" --property=UnitFileState --value 2>/dev/null || true)"
+  active_state="$(systemctl show "${unit}" --property=ActiveState --value 2>/dev/null || true)"
+
+  echo "load=${load_state:-unknown} unit_file=${unit_file_state:-unknown} active=${active_state:-unknown}"
 }
 
 create_user() {
@@ -144,19 +261,61 @@ validate_config() {
   fi
 }
 
-install_binary() {
-  local tmp_dir found_prompp found_tool
-  tmp_dir="$(mktemp -d)"
+ensure_config_from_release_or_default() {
+  local tmp_dir="$1"
+  local found_config=""
 
-  log "Downloading Prom++"
-  log "Version: ${PROMPP_VERSION}"
-  log "Arch:    ${PROMPP_ARCH}"
-  log "URL:     ${PROMPP_URL}"
-
-  if ! curl -fL --retry 3 --retry-delay 2 "${PROMPP_URL}" -o "${tmp_dir}/prompp.tar.gz"; then
-    rm -rf "${tmp_dir}"
-    die "Failed to download archive. Check PROMPP_VERSION/PROMPP_ARCH/PROMPP_URL"
+  if [[ -f "${CONFIG_FILE}" ]]; then
+    log "Config already exists: ${CONFIG_FILE}"
+    return
   fi
+
+  log "Config file not found, trying to create it: ${CONFIG_FILE}"
+
+  found_config="$(
+    find "${tmp_dir}/extract" -type f \( \
+      -iname 'prometheus.yml' -o \
+      -iname 'prometheus.yaml' -o \
+      -iname '*prometheus*.yml' -o \
+      -iname '*prometheus*.yaml' -o \
+      -iname '*example*.yml' -o \
+      -iname '*example*.yaml' \
+    \) | head -n1 || true
+  )"
+
+  if [[ -n "${found_config}" ]]; then
+    log "Using config from release archive:"
+    log "  ${found_config} -> ${CONFIG_FILE}"
+    install -m 0644 "${found_config}" "${CONFIG_FILE}"
+  else
+    warn "No example config found in archive; creating minimal clean config"
+
+    cat > "${CONFIG_FILE}" <<EOF
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "prompp"
+    static_configs:
+      - targets:
+          - "${LISTEN_ADDRESS}"
+EOF
+
+    chmod 0644 "${CONFIG_FILE}"
+  fi
+
+  chown root:root "${CONFIG_FILE}"
+}
+
+download_and_extract_release() {
+  local url="$1"
+  local tmp_dir="$2"
+
+  log "Downloading Prom++ release"
+  log "URL: ${url}"
+
+  curl -fL --retry 3 --retry-delay 2 "${url}" -o "${tmp_dir}/prompp.tar.gz"
 
   log "Extracting archive"
   mkdir -p "${tmp_dir}/extract"
@@ -164,24 +323,34 @@ install_binary() {
 
   log "Archive binaries found:"
   find "${tmp_dir}/extract" -maxdepth 4 -type f -perm -111 -print || true
+}
 
-  found_prompp="$(find "${tmp_dir}/extract" -type f -name 'prompp' | head -n1 || true)"
-  if [[ -z "${found_prompp}" ]]; then
-    found_prompp="$(find "${tmp_dir}/extract" -type f -perm -111 -iname '*prompp*' ! -iname '*tool*' | head -n1 || true)"
+find_binary_in_extract() {
+  local tmp_dir="$1"
+  local name="$2"
+  local found=""
+
+  found="$(find "${tmp_dir}/extract" -type f -name "${name}" | head -n1 || true)"
+
+  if [[ -z "${found}" ]]; then
+    found="$(find "${tmp_dir}/extract" -type f -perm -111 -iname "*${name}*" | head -n1 || true)"
   fi
 
-  [[ -n "${found_prompp}" ]] || {
-    rm -rf "${tmp_dir}"
-    die "Could not find prompp binary in archive"
-  }
+  echo "${found}"
+}
+
+install_binaries_from_tmp() {
+  local tmp_dir="$1"
+  local found_prompp found_tool
+
+  found_prompp="$(find_binary_in_extract "${tmp_dir}" "prompp")"
+
+  [[ -n "${found_prompp}" ]] || die "Could not find prompp binary in archive"
 
   log "Installing prompp -> ${BIN_PATH}"
   install -m 0755 "${found_prompp}" "${BIN_PATH}"
 
-  found_tool="$(find "${tmp_dir}/extract" -type f -name 'prompptool' | head -n1 || true)"
-  if [[ -z "${found_tool}" ]]; then
-    found_tool="$(find "${tmp_dir}/extract" -type f -perm -111 -iname '*prompptool*' | head -n1 || true)"
-  fi
+  found_tool="$(find_binary_in_extract "${tmp_dir}" "prompptool")"
 
   if [[ -n "${found_tool}" ]]; then
     log "Installing prompptool -> ${TOOL_PATH}"
@@ -191,15 +360,100 @@ install_binary() {
     rm -f "${TOOL_PATH}"
   fi
 
-  rm -rf "${tmp_dir}"
-
   log "Installed prompp version:"
   "${BIN_PATH}" --version || true
+}
+
+install_binary() {
+  local tmp_dir url
+  tmp_dir="$(mktemp -d)"
+
+  url="$(resolve_release_url)"
+
+  if ! download_and_extract_release "${url}" "${tmp_dir}"; then
+    rm -rf "${tmp_dir}"
+    die "Failed to download/extract release"
+  fi
+
+  if ! install_binaries_from_tmp "${tmp_dir}"; then
+    rm -rf "${tmp_dir}"
+    die "Failed to install binaries"
+  fi
+
+  ensure_config_from_release_or_default "${tmp_dir}"
+
+  rm -rf "${tmp_dir}"
+}
+
+backup_current_binaries() {
+  local backup_dir
+  backup_dir="${INSTALL_DIR}/binary-backups/$(date +%F-%H%M%S)"
+
+  install -d -m 0755 "${backup_dir}"
+
+  if [[ -x "${BIN_PATH}" ]]; then
+    cp -a "${BIN_PATH}" "${backup_dir}/prompp"
+  fi
 
   if [[ -x "${TOOL_PATH}" ]]; then
-    log "Installed prompptool:"
-    "${TOOL_PATH}" --help >/dev/null 2>&1 || true
+    cp -a "${TOOL_PATH}" "${backup_dir}/prompptool"
   fi
+
+  log "Current binaries backup:"
+  log "  ${backup_dir}"
+}
+
+release_update() {
+  need_root "$@"
+  check_os
+  need_cmds
+
+  local tmp_dir url old_version new_version
+
+  old_version="$(current_prompp_version || true)"
+  [[ -n "${old_version}" ]] && log "Current version: ${old_version}"
+
+  url="$(resolve_release_url)"
+  tmp_dir="$(mktemp -d)"
+
+  if ! download_and_extract_release "${url}" "${tmp_dir}"; then
+    rm -rf "${tmp_dir}"
+    die "Failed to download/extract release"
+  fi
+
+  # Stop only after successful download/extract.
+  if systemctl is-active --quiet prompp.service; then
+    log "Stopping prompp.service"
+    systemctl stop prompp.service
+  fi
+
+  backup_current_binaries
+
+  if ! install_binaries_from_tmp "${tmp_dir}"; then
+    rm -rf "${tmp_dir}"
+    die "Failed to install updated binaries. Backup is in ${INSTALL_DIR}/binary-backups/"
+  fi
+
+  rm -rf "${tmp_dir}"
+
+  systemctl daemon-reload
+
+  log "Starting prompp.service"
+  systemctl start prompp.service
+
+  sleep 1
+
+  if ! systemctl is-active --quiet prompp.service; then
+    warn "prompp.service is not active after update"
+    systemctl --no-pager --full status prompp.service || true
+    die "Update installed binaries, but service failed to start. Check logs: journalctl -u prompp -n 100"
+  fi
+
+  new_version="$(current_prompp_version || true)"
+  [[ -n "${new_version}" ]] && log "New version: ${new_version}"
+
+  log "Release update completed successfully"
+  systemctl --no-pager --full status prompp.service || true
 }
 
 stop_old_prometheus() {
@@ -208,16 +462,20 @@ stop_old_prometheus() {
     return
   fi
 
-  if systemctl list-unit-files | grep -q '^prometheus\.service'; then
-    if systemctl is-active --quiet prometheus; then
+  log "Checking prometheus.service state: $(unit_debug_state "prometheus.service")"
+
+  if unit_exists "prometheus.service"; then
+    if unit_is_active "prometheus.service"; then
       log "Stopping prometheus.service"
-      systemctl stop prometheus
+      systemctl stop prometheus.service
+    else
+      log "prometheus.service exists but is not active"
     fi
 
     log "Disabling prometheus.service"
-    systemctl disable prometheus >/dev/null 2>&1 || true
+    systemctl disable prometheus.service >/dev/null 2>&1 || true
   else
-    log "prometheus.service not found; nothing to stop"
+    warn "prometheus.service not found by systemctl show; nothing to stop"
   fi
 }
 
@@ -340,10 +598,10 @@ EOF
 
 start_prompp() {
   log "Enabling and starting prompp.service"
-  systemctl enable --now prompp
+  systemctl enable --now prompp.service
 
   log "Service status:"
-  systemctl --no-pager --full status prompp || true
+  systemctl --no-pager --full status prompp.service || true
 }
 
 install_prompp() {
@@ -351,13 +609,12 @@ install_prompp() {
   check_os
   need_cmds
 
-  PROMPP_ARCH="$(detect_arch)"
-  PROMPP_URL="${PROMPP_URL:-https://github.com/deckhouse/prompp/releases/download/${PROMPP_VERSION}/prompp-binaries-${PROMPP_ARCH}.tar.gz}"
+  PROMPP_ARCH="$(normalize_arch)"
 
   create_user
   create_dirs
-  validate_config
   install_binary
+  validate_config
   migrate_existing_data
   create_service
   start_prompp
@@ -375,6 +632,9 @@ install_prompp() {
   echo "  curl http://${LISTEN_ADDRESS}/-/ready"
   echo "  curl http://${LISTEN_ADDRESS}/api/v1/targets"
   echo
+  echo "Release update:"
+  echo "  sudo $0 release-update"
+  echo
   echo "Rollback:"
   echo "  sudo $0 uninstall"
   echo "--------------------------------------------------"
@@ -384,26 +644,28 @@ uninstall_prompp() {
   need_root "$@"
 
   log "Stopping prompp.service"
-  systemctl stop prompp 2>/dev/null || true
-  systemctl disable prompp 2>/dev/null || true
+  systemctl stop prompp.service 2>/dev/null || true
+  systemctl disable prompp.service 2>/dev/null || true
 
   log "Removing prompp.service"
   rm -f "${SERVICE_FILE}"
   systemctl daemon-reload
-  systemctl reset-failed prompp 2>/dev/null || true
+  systemctl reset-failed prompp.service 2>/dev/null || true
 
-  log "Removing binaries and install dir"
+  log "Removing binaries"
   rm -f "${BIN_PATH}" "${TOOL_PATH}"
-  rm -rf "${INSTALL_DIR}"
 
-  log "Prom++ config/data kept:"
-  echo "  config: ${CONFIG_FILE}"
-  echo "  data:   ${DATA_DIR}"
+  log "Prom++ install/config/data kept:"
+  echo "  install dir: ${INSTALL_DIR}"
+  echo "  config:      ${CONFIG_FILE}"
+  echo "  data:        ${DATA_DIR}"
   echo
 
-  if systemctl list-unit-files | grep -q '^prometheus\.service'; then
+  log "Checking prometheus.service state: $(unit_debug_state "prometheus.service")"
+
+  if unit_exists "prometheus.service"; then
     log "Restoring vanilla prometheus.service"
-    systemctl enable --now prometheus || warn "Could not start prometheus.service. Check manually: systemctl status prometheus"
+    systemctl enable --now prometheus.service || warn "Could not start prometheus.service. Check manually: systemctl status prometheus"
   else
     warn "prometheus.service not found; rollback service start skipped"
   fi
@@ -419,47 +681,63 @@ purge_prompp() {
   log "Purging Prom++ data dir: ${DATA_DIR}"
   rm -rf "${DATA_DIR}"
 
+  log "Purging Prom++ install dir: ${INSTALL_DIR}"
+  rm -rf "${INSTALL_DIR}"
+
   log "Purge completed"
 }
 
 status_prompp() {
-  systemctl --no-pager --full status prompp || true
+  systemctl --no-pager --full status prompp.service || true
 }
 
 restart_prompp() {
   need_root "$@"
   systemctl daemon-reload
-  systemctl restart prompp
+  systemctl restart prompp.service
   status_prompp
 }
 
 logs_prompp() {
-  journalctl -u prompp -f
+  journalctl -u prompp.service -f
+}
+
+show_latest_url() {
+  need_cmds
+  resolve_release_url
 }
 
 usage() {
   cat <<EOF
 Usage:
+  # promppctl version: ${PROMPPCTL_VERSION}
+
   sudo $0 install
+  sudo $0 release-update
   sudo $0 uninstall
   sudo $0 purge
   $0 status
   sudo $0 restart
   $0 logs
+  $0 latest-url
 
 Commands:
-  install     Install Prom++, optionally migrate Prometheus data copy, replace prometheus.service
-  uninstall   Remove Prom++ service/binaries and start prometheus.service back
-  purge       uninstall + remove Prom++ DATA_DIR
-  status      Show prompp.service status
-  restart     Restart prompp.service
-  logs        Follow prompp.service logs
+  install         Install Prom++, auto-detect latest release, create config if missing, optionally migrate Prometheus data copy
+  release-update Download latest release, stop prompp, backup old binaries, replace binaries, start prompp
+  uninstall       Remove Prom++ service/binaries and start prometheus.service back
+  purge           uninstall + remove Prom++ DATA_DIR and install dir
+  status          Show prompp.service status
+  restart         Restart prompp.service
+  logs            Follow prompp.service logs
+  latest-url      Print resolved GitHub release asset URL
 
-Environment overrides:
+Release environment overrides:
+  GITHUB_REPO=${GITHUB_REPO}
   PROMPP_VERSION=${PROMPP_VERSION}
   PROMPP_ARCH=${PROMPP_ARCH}
-  PROMPP_URL=${PROMPP_URL}
+  PROMPP_URL=${PROMPP_URL:-}
 
+Common environment overrides:
   PROMPP_USER=${PROMPP_USER}
   PROMPP_GROUP=${PROMPP_GROUP}
 
@@ -480,7 +758,15 @@ Examples:
 
   sudo MIGRATE_DATA=0 LISTEN_ADDRESS="127.0.0.1:9091" $0 install
 
+  sudo MIGRATE_DATA=0 REPLACE_PROMETHEUS=0 LISTEN_ADDRESS="127.0.0.1:9091" $0 install
+
   sudo FORCE_MIGRATE=1 $0 install
+
+  sudo $0 release-update
+
+  sudo PROMPP_VERSION="v0.8.0-rc3" $0 release-update
+
+  sudo PROMPP_URL="https://github.com/deckhouse/prompp/releases/download/v0.8.0-rc3/prompp-binaries-amd64.tar.gz" $0 release-update
 
   sudo $0 uninstall
 EOF
@@ -489,6 +775,9 @@ EOF
 case "${1:-}" in
   install)
     install_prompp "$@"
+    ;;
+  release-update|update-release|upgrade)
+    release_update "$@"
     ;;
   uninstall)
     uninstall_prompp "$@"
@@ -505,8 +794,12 @@ case "${1:-}" in
   logs)
     logs_prompp
     ;;
+  latest-url)
+    show_latest_url
+    ;;
   *)
     usage
     exit 1
     ;;
 esac
+```
